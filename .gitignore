@@ -1,0 +1,23 @@
+# Секреты
+.env
+
+# Данные — не общий код, у каждого свои
+bridge.db
+tenants/
+cache/
+backup/
+session_backups/
+
+# MAX-сессии/логин-кэш
+*.session
+maxlogin_venv/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+*.egg-info/
+.pytest_cache/
+
+# ОС/редакторы
+.DS_Store
