@@ -55,6 +55,48 @@ class _PatchedReactionUpdateEvent(_BaseReactionUpdateEvent):
 _pymax_mapping.ReactionUpdateEvent = _PatchedReactionUpdateEvent
 
 
+def _is_file_access_denied(exc: Exception) -> bool:
+    return "file.access" in str(exc).lower()
+
+
+async def _get_file_info_with_fallback(
+    client, *, chat_id, message_id, file_id, alt_chat_id, alt_message_id
+):
+    """Просит у MAX ссылку на файл у исходного сообщения; у пересланных файлов
+    MAX часто отвечает error.user.file.access, и тогда один раз пробуем то же
+    через само пересланное сообщение. Если не вышло и там — поднимаем первую
+    (основную) ошибку."""
+    try:
+        return await client.get_file_by_id(chat_id=chat_id, message_id=message_id, file_id=file_id)
+    except Exception as first_error:
+        if not _is_file_access_denied(first_error) or (alt_chat_id, alt_message_id) == (chat_id, message_id):
+            raise
+        state.log.info(
+            f"Файл недоступен через исходное сообщение ({message_id}), пробую через пересланное ({alt_message_id})"
+        )
+        try:
+            info = await client.get_file_by_id(
+                chat_id=alt_chat_id, message_id=alt_message_id, file_id=file_id
+            )
+            state.log.info("Запасная попытка получить файл удалась")
+            return info
+        except Exception as second_error:
+            state.log.info(f"Запасная попытка тоже не удалась: {second_error}")
+            raise first_error
+
+
+def _format_title_change(who: str, title: str | None) -> str:
+    """Служебное событие MAX «title» — переименование группы. Новое название
+    лежит в поле title вложения; если его по какой-то причине нет, всё равно
+    сообщаем, что название сменили."""
+    if title:
+        return (
+            f"<blockquote><i>✏️ <b>{safe_html(who)}</b> изменил(а) название группы: "
+            f"«{safe_html(str(title))}»</i></blockquote>"
+        )
+    return f"<blockquote><i>✏️ <b>{safe_html(who)}</b> изменил(а) название группы</i></blockquote>"
+
+
 def _strip_html_tags(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text)
 
@@ -453,16 +495,20 @@ async def _handle_max_message(message: MaxMessage, client: Client, *, tg_group_i
                 # === ФАЙЛ / ДОКУМЕНТ ===
                 elif attach_type == "FILE":
                     state.log.info(f"Обрабатываю FILE: {attach}")
+                    file_name = "file"
                     try:
                         file_id = getattr(attach, "file_id", None) or attach.get("file_id") or attach.get("fileId")
                         file_name = getattr(attach, "name", None) or attach.get("name") or "file"
                         state.log.info(f"file_id={file_id}, name={file_name}")
 
                         if file_id and message.chat_id and message.id:
-                            file_info = await client.get_file_by_id(
+                            file_info = await _get_file_info_with_fallback(
+                                client,
                                 chat_id=src_chat_id or message.chat_id,
                                 message_id=getattr(src_msg, "id", None) or message.id,
                                 file_id=file_id,
+                                alt_chat_id=message.chat_id,
+                                alt_message_id=message.id,
                             )
                             state.log.info(f"file_info={file_info}")
 
@@ -583,9 +629,14 @@ async def _handle_max_message(message: MaxMessage, client: Client, *, tg_group_i
                             })
                     except Exception as e:
                         state.log.error(f"Ошибка файла: {e}")
+                        reason = (
+                            "MAX не дал доступ к файлу"
+                            if _is_file_access_denied(e)
+                            else "ошибка загрузки"
+                        )
                         kwargs = {
                             "chat_id": target_chat_id,
-                            "text": prefix + "📎 Файл (ошибка загрузки)",
+                            "text": prefix + f"📎 Файл: {safe_html(file_name)} ({reason})",
                             "parse_mode": "HTML"
                         }
                         if target_thread_id is not None:
@@ -814,6 +865,9 @@ async def _handle_max_message(message: MaxMessage, client: Client, *, tg_group_i
                             f"<blockquote><i>🚫 <b>{safe_html(remover)}</b> исключил(а) "
                             f"<b>{safe_html(removed)}</b> из группы</i></blockquote>"
                         )
+                    elif event == "title":
+                        who = await get_name(message.sender)
+                        text = _format_title_change(who, get_extra("title"))
                     elif event == "joinbylink":
                         who = await get_name(get_extra("userId") or get_extra("user_id") or message.sender)
                         text = f"<blockquote><i>🔗 <b>{safe_html(who)}</b> присоединился(ась) по ссылке</i></blockquote>"
@@ -1402,8 +1456,10 @@ async def _reaction_poll_loop(client: Client, *, db_path: str):
     _handle_reaction_update) — единственный рабочий способ узнать про
     MAX-реакцию это спросить сервер самим. Опрашиваем только недавние
     сообщения (_REACTION_POLL_WINDOW_HOURS), не все подряд."""
-    while True:
+    while not getattr(client, "_bridge_stopped", False):
         await asyncio.sleep(_REACTION_POLL_INTERVAL)
+        if getattr(client, "_bridge_stopped", False):
+            return
         try:
             await _poll_reactions_once(client, db_path=db_path)
         except Exception as e:
@@ -1509,7 +1565,7 @@ def register_tenant_handlers(client: Client, *, tg_group_id: int, db_path: str):
         так граница для добора пропущенных (_backfill_missed_messages)
         остаётся свежей даже без входящих сообщений, а не тянется от
         случайного прошлого момента."""
-        while True:
+        while not getattr(client, "_bridge_stopped", False):
             try:
                 await set_last_seen_at(int(time.time()), db_path=db_path)
             except Exception as e:

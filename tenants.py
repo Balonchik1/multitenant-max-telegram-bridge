@@ -21,6 +21,7 @@
 """
 import asyncio
 import os
+import shutil
 import time
 
 import aiosqlite
@@ -52,6 +53,12 @@ _pending_remember_password: dict[int, str] = {}
 # слать одно и то же в группу/личку на каждое упавшее сообщение.
 _last_broken_notice: dict[int, float] = {}
 _BROKEN_NOTICE_COOLDOWN = 3600  # 1 час
+
+# owner_id, у которых прямо сейчас идёт /logout — защита от двойного нажатия кнопки.
+_logging_out: set[int] = set()
+_LOGOUT_TIMEOUT = 15
+_CANCEL_ATTEMPTS = 5
+_CANCEL_STEP_TIMEOUT = 3
 
 
 async def notify_group_broken(owner_id: int, tg_group_id: int, reason: str):
@@ -339,6 +346,14 @@ async def _run_login(owner_id: int, phone: str):
             # следующую команду админа.
             auth_flow._auth_waiting = False
 
+    # Клиента убрали из реестра, пока шёл вход (/logout или более новая попытка
+    # входа) — результат этой попытки уже никому не нужен, и он не должен
+    # затирать сброшенное состояние сообщением «не получилось войти».
+    if state.tenant_clients.get(owner_id) is not client:
+        wait_done.cancel()
+        start_task.cancel()
+        return
+
     if login_done.is_set():
         wait_done.cancel()
         _run_tasks[owner_id] = start_task
@@ -416,6 +431,10 @@ async def _watch_tenant_task(owner_id: int, task: asyncio.Task):
     except asyncio.CancelledError:
         return
     except Exception as e:
+        # Задачу уже убрали из _run_tasks (/logout или переподключение новым
+        # клиентом) — это не обрыв связи, тенанту сообщать нечего.
+        if _run_tasks.get(owner_id) is not task:
+            return
         state.log.warning(f"MAX-клиент tenant'а {owner_id} завершился с ошибкой: {e}")
         state.tenant_clients.pop(owner_id, None)
         _run_tasks.pop(owner_id, None)
@@ -431,6 +450,312 @@ async def _watch_tenant_task(owner_id: int, task: asyncio.Task):
 def _is_valid_phone(text: str) -> bool:
     t = text.strip().lstrip("+")
     return t.isdigit() and 10 <= len(t) <= 15
+
+
+async def _bounded(coro, timeout: float):
+    """Как asyncio.wait_for, но не зависает, если сама корутина игнорирует
+    отмену: wait_for после таймаута ещё и ждёт, пока отменённая задача
+    реально завершится, а клиент pymax при отмене может этого не сделать."""
+    fut = asyncio.ensure_future(coro)
+    done, _ = await asyncio.wait({fut}, timeout=timeout)
+    if not done:
+        fut.cancel()
+        raise asyncio.TimeoutError()
+    return fut.result()
+
+
+async def perform_logout(owner_id: int) -> dict:
+    """Полностью отключает tenant'а: завершает его сессию на стороне MAX,
+    останавливает клиент, стирает его данные входа и служебную БД с диска и
+    возвращает запись в состояние «ждём номер». Telegram-группа не трогается.
+
+    Возвращает {"server_logout": True/False/None, "tg_group_id": int|None}:
+    True — сессия завершена на стороне MAX; False — попытка не удалась
+    (нет связи); None — живого клиента не было (например, после рестарта
+    бота до /retry), так что завершить сессию на стороне MAX было нечем."""
+    tenant = await _get_tenant(owner_id)
+    prior_group_id = tenant.get("tg_group_id") if tenant else None
+    # Завершать сессию на стороне MAX имеет смысл, только если вход уже был
+    # выполнен; если человек сам прерывает вход (ждём SMS-код, 2FA и т.п.),
+    # авторизованной сессии ещё нет.
+    was_logged_in = bool(tenant) and tenant["status"] in ("awaiting_group", "active")
+
+    client = state.tenant_clients.pop(owner_id, None)
+    task = _run_tasks.pop(owner_id, None)
+
+    # Идёт ожидание SMS-кода/пароля именно от этого человека — будим поток,
+    # иначе вход висел бы до 10-минутного таймаута.
+    if auth_flow.login_lock.locked() and auth_flow._active_login_target_id == owner_id:
+        auth_flow.cancel_pending_input()
+
+    server_logout = None
+    if client is not None:
+        # Флаг читают фоновые циклы (heartbeat, опрос реакций) — без него они
+        # продолжили бы стучаться в уже стёртую БД и закрытый клиент.
+        client._bridge_stopped = True
+        # MAX рвёт соединение сразу после запроса выхода. Встроенный цикл
+        # pymax в этот момент переподключился бы с уже отозванным токеном и
+        # запросил SMS-код на номер владельца — гасим это до запроса выхода.
+        cfg = getattr(client, "extra_config", None)
+        if cfg is not None:
+            cfg.reconnect = False
+            cfg.relogin = False
+        if was_logged_in:
+            try:
+                await _bounded(client.logout(), _LOGOUT_TIMEOUT)
+                server_logout = True
+            except Exception as e:
+                # MAX на запрос выхода обычно сразу рвёт соединение, и pymax
+                # отдаёт ошибку вместо подтверждения — исход неоднозначный.
+                state.log.warning(f"logout на стороне MAX для {owner_id} не подтверждён: {e}")
+                server_logout = False
+
+    if task is not None:
+        # pymax внутри close() глотает CancelledError (ловит его при остановке
+        # ping-задачи) — одной отмены может не хватить, поэтому повторяем.
+        for _ in range(_CANCEL_ATTEMPTS):
+            if task.done():
+                break
+            task.cancel()
+            await asyncio.wait({task}, timeout=_CANCEL_STEP_TIMEOUT)
+        if task.done() and not task.cancelled():
+            task.exception()  # забираем исключение, чтобы не было "never retrieved"
+    if client is not None:
+        try:
+            await _bounded(client.close(), _LOGOUT_TIMEOUT)
+        except Exception as e:
+            state.log.warning(f"client.close() для {owner_id}: {e}")
+
+    for group_id in [g for g, o in state.tenant_group_map.items() if o == owner_id]:
+        state.tenant_group_map.pop(group_id, None)
+    state.tenant_2fa_passwords.pop(owner_id, None)
+    _pending_remember_password.pop(owner_id, None)
+    _last_broken_notice.pop(owner_id, None)
+
+    tenant_dir = os.path.dirname(state.tenant_db_path(owner_id))
+    await asyncio.to_thread(shutil.rmtree, tenant_dir, True)
+    if os.path.exists(tenant_dir):
+        state.log.warning(f"Не удалось полностью удалить {tenant_dir} при /logout tenant'а {owner_id}")
+
+    async with aiosqlite.connect(state.DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE tenant_accounts
+            SET status = 'awaiting_phone', max_phone = NULL, tg_group_id = NULL,
+                max_2fa_password = NULL, updated_at = strftime('%s', 'now')
+            WHERE owner_id = ?
+            """,
+            (owner_id,),
+        )
+        await db.commit()
+
+    return {"server_logout": server_logout, "tg_group_id": prior_group_id, "was_logged_in": was_logged_in}
+
+
+async def revoke_tenant(owner_id: int) -> dict | None:
+    """Админ запретил пользователя (/deny или кнопка «Отклонить»): если у него
+    есть подключение или незавершённый вход, отключаем так же, как /logout,
+    но без повторного онбординга, и предупреждаем его и его группу.
+    Возвращает результат perform_logout или None, если отключать было нечего."""
+    tenant = await _get_tenant(owner_id)
+    if not tenant or tenant["status"] == "awaiting_phone" or owner_id in _logging_out:
+        return None
+
+    _logging_out.add(owner_id)
+    try:
+        result = await perform_logout(owner_id)
+    finally:
+        _logging_out.discard(owner_id)
+
+    if result["tg_group_id"]:
+        try:
+            await state.tg_bot.send_message(
+                result["tg_group_id"],
+                "🔌 Мост с MAX отключён администратором. Новые сообщения сюда больше приходить не будут.",
+            )
+        except Exception:
+            pass
+    try:
+        await state.tg_bot.send_message(
+            owner_id,
+            "Администратор отключил твой аккаунт от моста, данные входа удалены с сервера.\n"
+            "Если это ошибка, напиши сюда сообщение — создатель его увидит.",
+        )
+    except Exception:
+        pass
+    return result
+
+
+def _is_command(m, name: str) -> bool:
+    text = (m.text or "").strip()
+    return bool(text) and text.split()[0].split("@")[0] == name
+
+
+def _is_logout_command(m) -> bool:
+    return _is_command(m, "/logout")
+
+
+def _is_cancel_command(m) -> bool:
+    return _is_command(m, "/cancel")
+
+
+def _logout_keyboard(owner_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Да, отключить", callback_data=f"logout:yes:{owner_id}"),
+        InlineKeyboardButton(text="Отмена", callback_data=f"logout:no:{owner_id}"),
+    ]])
+
+
+# Статусы, в которых вход в MAX не завершён: отключать на стороне MAX нечего,
+# нужно только прервать попытку и очистить следы.
+_UNFINISHED_LOGIN_STATUSES = ("awaiting_login", "needs_2fa", "failed")
+
+
+async def _run_logout(owner_id: int, edit) -> None:
+    """Общий исполнитель для /logout (после подтверждения) и /cancel: делает
+    perform_logout, сообщает итог через edit(text), уведомляет группу и админа
+    и заново запускает онбординг."""
+    if owner_id in _logging_out:
+        return
+    _logging_out.add(owner_id)
+    try:
+        await edit("⏳ Отключаю…")
+        result = await perform_logout(owner_id)
+    except Exception as e:
+        state.log.warning(f"/logout tenant'а {owner_id} упал: {e}")
+        await edit("❌ Не получилось отключить полностью. Напиши /support, разберёмся.")
+        return
+    finally:
+        _logging_out.discard(owner_id)
+
+    if not result["was_logged_in"]:
+        text = "✅ Вход отменён, всё лишнее удалено. Входа в MAX у бота больше нет."
+    elif result["server_logout"] is True:
+        text = "✅ Готово: сессия в MAX завершена, данные входа удалены с сервера."
+    else:
+        why = (
+            "MAX не подтвердил завершение сессии (он обрывает соединение сразу после запроса выхода)"
+            if result["server_logout"] is False
+            else "у бота не было живого соединения, поэтому завершить сессию на стороне MAX он не мог"
+        )
+        text = (
+            f"⚠️ Данные входа удалены с сервера, но {why}.\n"
+            "Чтобы быть уверенным, закрой сеанс этого бота вручную в списке устройств в настройках MAX."
+        )
+    await edit(text)
+
+    group_id = result["tg_group_id"]
+    if group_id:
+        try:
+            await state.tg_bot.send_message(
+                group_id,
+                "🔌 Мост с MAX отключён владельцем. Новые сообщения сюда больше приходить не будут.",
+            )
+        except Exception:
+            pass
+    try:
+        await state.tg_bot.send_message(
+            ADMIN_ID, f"🔌 Пользователь <code>{owner_id}</code> отключил свой MAX-аккаунт (/logout).",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+    await start_onboarding(owner_id)
+
+
+@state.dp.message(lambda m: m.chat.type == "private" and m.from_user is not None and _is_logout_command(m))
+async def cmd_logout(message: TgMessage):
+    owner_id = message.from_user.id
+    if owner_id == ADMIN_ID:
+        await message.reply("Эта команда для подключённых пользователей, у админа свой аккаунт.")
+        return
+
+    tenant = await _get_tenant(owner_id)
+    if not tenant or tenant["status"] == "awaiting_phone":
+        await message.reply("Нечего отключать: ты ещё не подключал MAX-аккаунт.")
+        return
+
+    if tenant["status"] in _UNFINISHED_LOGIN_STATUSES:
+        question = (
+            "Вход в MAX ещё не завершён. Отменить его и удалить все данные, которые бот успел сохранить?\n\n"
+            "Подключить аккаунт заново можно через /start."
+        )
+    else:
+        question = (
+            "Отключить твой MAX-аккаунт от моста?\n\n"
+            "Бот завершит свою сессию в MAX и удалит с сервера данные входа: файлы сессии, "
+            "сохранённый облачный пароль и служебную базу этого моста.\n\n"
+            "Telegram-группа и твоя переписка в MAX останутся как есть. "
+            "Подключить аккаунт заново можно через /start."
+        )
+    await message.reply(question, reply_markup=_logout_keyboard(owner_id))
+
+
+@state.dp.message(lambda m: m.chat.type == "private" and m.from_user is not None and _is_cancel_command(m))
+async def cmd_cancel(message: TgMessage):
+    """Быстро прервать незавершённый вход (ждём SMS-код/пароль, ошибка входа)
+    без подтверждения — отменять тут нечего терять."""
+    owner_id = message.from_user.id
+    if owner_id == ADMIN_ID:
+        await message.reply("Эта команда для подключённых пользователей, у админа свой аккаунт.")
+        return
+
+    tenant = await _get_tenant(owner_id)
+    if not tenant or tenant["status"] == "awaiting_phone":
+        await message.reply("Нечего отменять.")
+        return
+    if tenant["status"] not in _UNFINISHED_LOGIN_STATUSES:
+        await message.reply("Вход уже завершён, отменять нечего. Чтобы отключить аккаунт, напиши /logout.")
+        return
+
+    async def edit(text: str):
+        await message.reply(text)
+
+    await _run_logout(owner_id, edit)
+
+
+@state.dp.callback_query(lambda c: c.data and c.data.startswith("logout:"))
+async def cb_logout(query: CallbackQuery):
+    parts = (query.data or "").split(":")
+    if len(parts) != 3:
+        await query.answer("Ошибка данных")
+        return
+    _, answer, owner_id_s = parts
+    try:
+        owner_id = int(owner_id_s)
+    except ValueError:
+        await query.answer("Плохой id")
+        return
+
+    if not query.from_user or query.from_user.id != owner_id:
+        await query.answer("Это не твоя кнопка", show_alert=True)
+        return
+
+    async def edit(text: str):
+        if query.message:
+            try:
+                await query.message.edit_text(text)
+            except Exception:
+                pass
+
+    if answer != "yes":
+        await query.answer("Отменено")
+        await edit("Отмена, ничего не изменено.")
+        return
+
+    if owner_id in _logging_out:
+        await query.answer("Уже отключаю")
+        return
+
+    tenant = await _get_tenant(owner_id)
+    if not tenant or tenant["status"] == "awaiting_phone":
+        await query.answer("Сейчас отключить нельзя")
+        await edit("Сейчас отключать нечего. Если нужно подключиться — напиши /start.")
+        return
+
+    await query.answer()
+    await _run_logout(owner_id, edit)
 
 
 @state.dp.message(lambda m: m.chat.type == "private" and m.from_user is not None)

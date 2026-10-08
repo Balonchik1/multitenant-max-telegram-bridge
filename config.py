@@ -16,6 +16,13 @@ def _env(name: str, required: bool = True, default: str = "") -> str:
     return value
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() not in ("0", "false", "no", "off")
+
+
 TG_TOKEN = _env("TG_TOKEN")
 TG_GROUP_ID = int(_env("TG_GROUP_ID"))
 TG_GROUP_FLAT = int(_env("TG_GROUP_FLAT"))
@@ -27,6 +34,10 @@ ALLOWED_GROUPS = {
 }
 
 ADMIN_ID = int(_env("ADMIN_ID"))
+# Нужно ли подтверждение админа, прежде чем незнакомый человек начнёт подключать
+# свой MAX-аккаунт. По умолчанию включено (закрытая регистрация); false/0/off —
+# любой, кто написал боту, сразу идёт на вход.
+REQUIRE_APPROVAL = _env_flag("REQUIRE_APPROVAL", default=True)
 MAX_PHONE = _env("MAX_PHONE")
 # Необязательно: короткий путь для ТВОЕГО собственного входа (см. auth_flow.py) —
 # без него просто каждый раз спросит пароль в личке, как и для любого tenant'а.

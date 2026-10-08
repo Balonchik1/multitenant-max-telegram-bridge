@@ -2,9 +2,15 @@ import logging
 import aiosqlite
 
 from aiogram import Dispatcher, Bot
-from aiogram.types import Message as TgMessage
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message as TgMessage,
+)
 from aiogram.dispatcher.event.bases import SkipHandler
 
+from config import REQUIRE_APPROVAL
 from formatters import safe_html
 
 log = logging.getLogger("bridge.access")
@@ -90,6 +96,76 @@ async def _notify_admin_new_user(uid: int, username: str | None, full_name: str)
         log.warning(f"notify admin new user: {e}")
 
 
+def _approval_keyboard(uid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Разрешить", callback_data=f"access:allow:{uid}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"access:deny:{uid}"),
+    ]])
+
+
+async def _request_approval(uid: int, username: str | None, full_name: str) -> None:
+    """Незнакомый человек написал боту при включённом REQUIRE_APPROVAL: ставим
+    ему статус pending и отправляем админу заявку с кнопками."""
+    await upsert_access(uid, "pending", username, full_name)
+    if not _bot:
+        return
+    uname = f"@{username}" if username else "—"
+    try:
+        await _bot.send_message(
+            _admin_id,
+            (
+                f"🆕 <b>Заявка на подключение</b>\n\n"
+                f"Имя: <b>{safe_html(full_name)}</b>\n"
+                f"Username: {safe_html(uname)}\n"
+                f"id: <code>{uid}</code>"
+            ),
+            parse_mode="HTML",
+            reply_markup=_approval_keyboard(uid),
+        )
+    except Exception as e:
+        log.warning(f"notify admin approval request: {e}")
+
+
+_INTRO_TEXT = (
+    "Это мост между MAX и Telegram: переписка из MAX приходит сюда отдельными темами "
+    "в твоей Telegram-группе, а ответы отсюда уходят обратно в MAX.\n\n"
+    "Технически для этого боту нужен полный доступ к твоему аккаунту MAX (как у самого приложения). "
+    "Рекомендую подключать аккаунт без важной переписки и без привязанных Госуслуг. "
+    "Доступ можно отозвать в любой момент: командой /logout или в приложении MAX, "
+    "завершив сессию бота в списке устройств.\n\n"
+    "Доступ выдаёт администратор. Нажми кнопку, если хочешь отправить заявку."
+)
+async def _revoke_connected(target_id: int) -> str | None:
+    """Если у запрещаемого человека есть подключение (или незавершённый вход),
+    отключает его и возвращает пояснение для админа; иначе None."""
+    try:
+        import tenants  # отложенный импорт — рвём цикл access<->tenants<->state
+        result = await tenants.revoke_tenant(target_id)
+    except Exception as e:
+        log.warning(f"revoke on deny {target_id}: {e}")
+        return f"⚠️ Отключить подключение не получилось: {safe_html(str(e))}"
+    if result is None:
+        return None
+    if not result["was_logged_in"]:
+        return "Незавершённый вход отменён, данные удалены."
+    if result["server_logout"] is True:
+        return "Подключение отключено: сессия в MAX завершена, данные входа удалены."
+    return (
+        "Подключение отключено, данные входа удалены, но MAX не подтвердил завершение сессии "
+        "(или живого соединения не было). Проверь список устройств в MAX этого аккаунта."
+    )
+
+
+_PENDING_REPLY ="✅ Заявка отправлена администратору, жди решения. Как только её одобрят, я напишу."
+_PENDING_AGAIN_REPLY = "Твоя заявка уже на рассмотрении у администратора, жди решения."
+
+
+def _request_keyboard(uid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Отправить заявку", callback_data=f"access:request:{uid}"),
+    ]])
+
+
 async def _forward_support_message(uid: int, username: str | None, full_name: str, body: str) -> bool:
     if not _bot:
         return False
@@ -136,6 +212,14 @@ def setup_access(dp: Dispatcher, bot: Bot, db_path: str, admin_id: int):
                 "Бот пока в разработке.\n"
                 "Можешь написать сообщение сюда — создатель его увидит."
             )
+            return
+
+        if REQUIRE_APPROVAL and status == "pending":
+            await message.reply(_PENDING_AGAIN_REPLY)
+            return
+
+        if REQUIRE_APPROVAL and status is None:
+            await message.reply(_INTRO_TEXT, reply_markup=_request_keyboard(uid))
             return
 
         if status != "allowed":
@@ -186,6 +270,16 @@ def setup_access(dp: Dispatcher, bot: Bot, db_path: str, admin_id: int):
             raise SkipHandler()
 
         status = await get_access_status(uid)
+
+        if REQUIRE_APPROVAL and status == "pending":
+            if (message.text or "").startswith("/support"):
+                raise SkipHandler()  # пусть сможет написать админу, пока ждёт решения
+            await message.reply(_PENDING_AGAIN_REPLY)
+            return
+
+        if REQUIRE_APPROVAL and status is None:
+            await message.reply(_INTRO_TEXT, reply_markup=_request_keyboard(uid))
+            return
 
         if status is None:
             await upsert_access(uid, "allowed", username, full_name)
@@ -350,7 +444,13 @@ def setup_access(dp: Dispatcher, bot: Bot, db_path: str, admin_id: int):
             return
 
         await upsert_access(target_id, "denied")
-        await message.reply(f"❌ Запрещён <code>{target_id}</code>", parse_mode="HTML")
+        revoke_note = await _revoke_connected(target_id)
+        await message.reply(
+            f"❌ Запрещён <code>{target_id}</code>" + (f"\n{revoke_note}" if revoke_note else ""),
+            parse_mode="HTML",
+        )
+        if revoke_note:
+            return  # человека уже предупредил revoke_tenant, общий отказ был бы лишним
         try:
             await bot.send_message(
                 target_id,
@@ -359,3 +459,78 @@ def setup_access(dp: Dispatcher, bot: Bot, db_path: str, admin_id: int):
             )
         except Exception as e:
             await message.reply(f"(пользователю не написалось: {e})")
+
+    @dp.callback_query(lambda c: c.data and c.data.startswith("access:"))
+    async def cb_access(query: CallbackQuery):
+        parts = (query.data or "").split(":")
+        if len(parts) != 3 or parts[1] not in ("request", "allow", "deny"):
+            await query.answer("Ошибка данных")
+            return
+        try:
+            target_id = int(parts[2])
+        except ValueError:
+            await query.answer("Плохой id")
+            return
+
+        if parts[1] == "request":
+            # Кнопка «Отправить заявку» под вводным текстом — нажимает сам человек.
+            if not query.from_user or query.from_user.id != target_id:
+                await query.answer("Это не твоя кнопка", show_alert=True)
+                return
+            status = await get_access_status(target_id)
+            if status == "pending":
+                await query.answer("Заявка уже на рассмотрении")
+                return
+            if status is not None:
+                await query.answer("Сейчас заявку отправить нельзя")
+                return
+            u = query.from_user
+            full_name = f"{u.first_name or ''} {u.last_name or ''}".strip() or str(target_id)
+            await _request_approval(target_id, u.username, full_name)
+            await query.answer("Заявка отправлена")
+            if query.message:
+                try:
+                    await query.message.edit_text(_PENDING_REPLY)
+                except Exception:
+                    pass
+            return
+
+        if not query.from_user or query.from_user.id != _admin_id:
+            await query.answer("Только админ может решать", show_alert=True)
+            return
+
+        async def _edit(text: str):
+            if query.message:
+                try:
+                    await query.message.edit_text(text, parse_mode="HTML")
+                except Exception:
+                    pass
+
+        if parts[1] == "allow":
+            await upsert_access(target_id, "allowed")
+            await query.answer("Разрешён")
+            await _edit(f"✅ Разрешён <code>{target_id}</code>")
+            try:
+                await bot.send_message(target_id, "✅ Администратор одобрил твою заявку.")
+            except Exception as e:
+                log.warning(f"approve notify {target_id}: {e}")
+            try:
+                import tenants  # отложенный импорт — рвём цикл access<->tenants<->state
+                await tenants.start_onboarding(target_id)
+            except Exception as e:
+                await _edit(f"✅ Разрешён <code>{target_id}</code> (онбординг не запустился: {safe_html(str(e))})")
+        else:
+            await upsert_access(target_id, "denied")
+            revoke_note = await _revoke_connected(target_id)
+            await query.answer("Отклонён")
+            await _edit(f"❌ Отклонён <code>{target_id}</code>" + (f"\n{revoke_note}" if revoke_note else ""))
+            if revoke_note:
+                return
+            try:
+                await bot.send_message(
+                    target_id,
+                    "Заявка отклонена.\n"
+                    "Если это ошибка, напиши сюда сообщение — создатель его увидит.",
+                )
+            except Exception as e:
+                log.warning(f"deny notify {target_id}: {e}")

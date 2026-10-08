@@ -25,6 +25,9 @@ import state
 
 _auth_input_queue: queue.Queue[str] = queue.Queue()
 _auth_waiting = False
+# Маркер в очереди: поток, ждущий код/пароль, просыпается и прерывает вход
+# (см. cancel_pending_input). Не может совпасть с реальным вводом человека.
+_CANCEL_TOKEN = "\x00cancel\x00"
 _auth_future: asyncio.Future | None = None
 
 # Кому сейчас адресовать запрос кода/пароля (по умолчанию — админу, как раньше).
@@ -95,11 +98,22 @@ def _tg_input(prompt: str = "") -> str:
     except Exception as e:
         state.log.warning(f"tg input notify: {e}")
 
+    # Всё, что лежит в очереди к этому моменту, — устаревшее (в том числе
+    # маркер отмены от прошлой попытки, который никто не успел забрать).
+    while True:
+        try:
+            _auth_input_queue.get_nowait()
+        except queue.Empty:
+            break
+
     try:
         value = _auth_input_queue.get(timeout=600)
     except queue.Empty:
         _auth_waiting = False
         raise TimeoutError("Нет кода от ADMIN за 10 минут")
+    if value == _CANCEL_TOKEN:
+        _auth_waiting = False
+        raise TimeoutError("Вход отменён пользователем")
     value = value.strip()
     if is_password_prompt:
         last_entered_password = value
@@ -108,6 +122,18 @@ def _tg_input(prompt: str = "") -> str:
 
 builtins.input = _tg_input
 getpass.getpass = _tg_input
+
+
+def cancel_pending_input() -> bool:
+    """Прерывает ожидание кода/пароля, если оно сейчас идёт. Маркер кладём
+    только пока реально ждём — иначе он остался бы в очереди и сорвал бы
+    чужой следующий вход (хотя _tg_input и чистит очередь на входе)."""
+    global _auth_waiting
+    if not _auth_waiting:
+        return False
+    _auth_waiting = False
+    _auth_input_queue.put(_CANCEL_TOKEN)
+    return True
 
 
 async def ask_admin_tg(prompt: str) -> str:
