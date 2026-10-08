@@ -15,6 +15,7 @@ _resolve_route() определяет, какому MAX-клиенту и как
 import os
 
 from pymax import Client, Message as MaxMessage, Photo, File, Video, Voice, ApiError
+from pymax.exceptions import UploadError
 from aiogram.types import Message as TgMessage, MessageReactionUpdated, ReactionTypeEmoji
 from aiogram.exceptions import TelegramRetryAfter
 
@@ -26,6 +27,7 @@ from db_messages import (
 from db_meta import get_alias
 from media import download_tg_file, safe_remove, process_media_group
 import state
+import pymax_patches  # noqa: F401  (подменяет UploadService.upload_photo при импорте)
 
 import aiosqlite
 import asyncio
@@ -589,6 +591,46 @@ async def _report_tg_to_max_failure(message: TgMessage, what: str, e: Exception)
         pass
 
 
+_VOICE_READY_TIMEOUT = 20
+
+
+async def _send_voice_with_fallback(max_client, *, chat_id, text, reply_to, path, duration_ms):
+    """Голосовое отправляется как Voice (в MAX оно выглядит голосовым сообщением).
+    MAX сейчас на такую отправку стабильно отвечает «вложение не готово»
+    (проверено: ни ожидание сигнала готовности, ни повторы кадра в течение
+    10 секунд не помогают), поэтому при этой ошибке, ошибке загрузки или
+    зависании дольше _VOICE_READY_TIMEOUT секунд — сразу откат на File: звук
+    дойдёт, просто как вложение. Любые другие ошибки API поднимаются как есть."""
+    try:
+        return await asyncio.wait_for(
+            max_client.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_to=reply_to,
+                attachments=[Voice(path=path, duration=duration_ms)],
+            ),
+            timeout=_VOICE_READY_TIMEOUT,
+        )
+    except (ApiError, UploadError, asyncio.TimeoutError) as e:
+        if isinstance(e, ApiError) and "not.ready" not in str(e.error or e).lower():
+            raise
+        state.log.warning(f"Голосовое не принято как Voice, отправляю как File: {e!r}")
+        return await max_client.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_to=reply_to,
+            attachments=[File(path=path, name="voice.ogg")],
+        )
+
+
+_PRIVATE_ONLY_COMMANDS = ("/logout", "/cancel")
+
+
+def _is_private_only_command(text: str) -> bool:
+    parts = (text or "").strip().split()
+    return bool(parts) and parts[0].split("@")[0] in _PRIVATE_ONLY_COMMANDS
+
+
 @state.dp.message()
 async def telegram_to_max(message: TgMessage):
     max_client, db_path = _resolve_route(message.chat.id)
@@ -606,6 +648,13 @@ async def telegram_to_max(message: TgMessage):
         "/groups", "/addgroup", "/delgroup", "/alias", "/ping", "/link",
         "/setupgroup", "/retry",
     )):
+        return
+
+    if message.text and _is_private_only_command(message.text):
+        # Эти команды работают только в личке с ботом; без ответа человек
+        # решил бы, что команда выполнилась, а текст ушёл бы в MAX как обычное
+        # сообщение.
+        await message.reply("Эту команду нужно писать боту в личные сообщения, а не в группе.")
         return
 
     # === Обработка альбомов ===
@@ -725,35 +774,14 @@ async def telegram_to_max(message: TgMessage):
         if message.voice:
             try:
                 tmp_path = await download_tg_file(message.voice.file_id, suffix=".ogg")
-                # Voice, а не File — иначе MAX показывает голосовое как обычный
-                # файл-вложение, а не как голосовое сообщение. Но: у pymax 2.4.1
-                # есть встроенный авто-повтор именно для ошибки
-                # "attachment.not.ready", а MAX теперь стабильно отвечает более
-                # новым кодом "errors.process.attachment.video.not.ready" —
-                # библиотека его не узнаёт (точное сравнение строк) и никогда
-                # не ждёт готовности сама. Правильный фикс потребовал бы своего
-                # цикла загрузка+ожидание+повтор через приватные части pymax —
-                # слишком хрупко (сломается на следующем /update). Вместо
-                # этого: одна попытка как Voice, и если именно эта ошибка —
-                # откат на File (то, что и так стабильно работало раньше, просто
-                # выглядит как файл, а не как голосовое сообщение).
-                try:
-                    sent = await max_client.send_message(
-                        chat_id=max_chat_id,
-                        text=text,
-                        reply_to=reply_to_max_id,
-                        attachments=[Voice(path=tmp_path, duration=(message.voice.duration or 0) * 1000)]
-                    )
-                except ApiError as e:
-                    if "not.ready" not in str(e.error or e).lower():
-                        raise
-                    state.log.warning(f"Voice не готов на стороне MAX, отправляю как File: {e}")
-                    sent = await max_client.send_message(
-                        chat_id=max_chat_id,
-                        text=text,
-                        reply_to=reply_to_max_id,
-                        attachments=[File(path=tmp_path, name="voice.ogg")]
-                    )
+                sent = await _send_voice_with_fallback(
+                    max_client,
+                    chat_id=max_chat_id,
+                    text=text,
+                    reply_to=reply_to_max_id,
+                    path=tmp_path,
+                    duration_ms=(message.voice.duration or 0) * 1000,
+                )
                 if sent and getattr(sent, "id", None):
                     await save_message_mapping(
                         max_chat_id=max_chat_id,

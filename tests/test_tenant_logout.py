@@ -402,6 +402,28 @@ async def test_logout_confirm_full_flow_notifies_and_restarts_onboarding(env):
     assert OWNER not in tenants._logging_out
 
 
+async def test_logout_without_max_confirmation_is_reported_calmly(env):
+    """MAX всегда рвёт соединение на запрос выхода (подтверждения нет) — это
+    нормальный исход, и текст не должен пугать предупреждением."""
+    state.tenant_clients[OWNER] = FakeClient(logout_error=RuntimeError("Not connected to the server"))
+    q = FakeQuery(uid=OWNER, data=f"logout:yes:{OWNER}")
+
+    await tenants.cb_logout(q)
+
+    final = q.edits[-1]
+    assert "Готово" in final and "запрос на выход отправлен" in final
+    assert "⚠️" not in final
+    assert "не подтвердил" not in final
+
+
+async def test_logout_without_live_client_still_warns(env):
+    q = FakeQuery(uid=OWNER, data=f"logout:yes:{OWNER}")
+    await tenants.cb_logout(q)
+
+    assert "⚠️" in q.edits[-1]
+    assert "не было живого соединения" in q.edits[-1]
+
+
 async def test_watch_task_stays_silent_after_logout(env):
     async def boom():
         raise RuntimeError("соединение закрыто")

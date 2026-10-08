@@ -227,7 +227,7 @@ async def test_deny_command_disconnects_connected_user(env, monkeypatch):
     await env["handlers"]["cmd_deny"](msg)
 
     assert await _status(USER) == "denied"
-    assert "не подтвердил" in msg.replies[0]
+    assert "запрос на выход" in msg.replies[0]
     assert not any(chat == USER for chat, _, _ in env["bot"].sent)
 
 
