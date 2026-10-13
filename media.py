@@ -5,6 +5,7 @@ import tempfile
 import aiosqlite
 from pymax import Photo, File, Video
 
+import sender_policy
 import state
 from db_messages import get_max_message_id, save_message_mapping
 
@@ -65,7 +66,9 @@ async def process_media_group(media_group_id: str):
             return
 
         max_chat_id = row[0]
-        caption = first.caption or first.text or ""
+        caption = sender_policy.with_prefix(
+            sender_policy.author_prefix(first), first.caption or first.text or ""
+        )
 
         # Reply для альбома
         reply_to_max_id = None

@@ -70,6 +70,10 @@ TENANTS_ROOT = "tenants"
 tenant_clients: dict[int, Client] = {}       # owner_id -> pymax Client
 tenant_group_map: dict[int, int] = {}        # tg_group_id -> owner_id
 tenant_2fa_passwords: dict[int, str] = {}    # owner_id -> сохранённый облачный пароль (тёплый кэш из БД)
+# Владельцы с уже настроенным мостом, которых бот переподключает после рестарта:
+# пока их группа не появилась в tenant_group_map, сообщения из неё некому
+# принимать. bridge.main() не начинает читать Telegram, пока набор не опустеет.
+tenants_resuming: set[int] = set()
 
 
 def tenant_db_path(owner_id: int) -> str:

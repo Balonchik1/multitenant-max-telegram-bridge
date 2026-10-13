@@ -21,11 +21,42 @@ from db_messages import init_db, load_allowed_groups, cleanup_old_messages
 
 import auth_flow  # noqa: F401  (регистрирует @state.dp.message, ловит SMS/2FA код)
 import commands  # noqa: F401  (регистрирует /groups /link /ping /alias /chats ...)
+import sender_policy  # noqa: F401  (/senders в личке — до онбординга tenant'ов, который ловит любой личный текст)
 import tenants  # noqa: F401  (самостоятельная регистрация: онбординг tenant'ов)
 import relay_max_to_tg  # noqa: F401  (регистрирует @state.max_client.on_message и т.д.)
 import relay_tg_to_max  # noqa: F401  (последним — содержит catch-all @state.dp.message())
 
 log = state.log
+
+# Сколько секунд после старта ждём подключения к MAX, прежде чем начать читать
+# Telegram. Пока бот не читает, Telegram сам хранит сообщения (до суток), так что
+# ожидание ничего не теряет; ограничение нужно, чтобы бот не завис, если MAX
+# недоступен.
+STARTUP_READY_TIMEOUT = 40
+
+
+async def wait_until_max_ready(
+    admin_ready: asyncio.Event,
+    abort_tasks: set,
+    timeout: float = STARTUP_READY_TIMEOUT,
+) -> bool:
+    """Ждёт, пока подключится основной MAX-аккаунт и вернутся в строй группы
+    всех tenant'ов (state.tenants_resuming опустеет). Без этого сообщения из
+    Telegram, накопившиеся за время перезапуска, обрабатывались бы раньше, чем
+    бот успеет подключиться к MAX, и тихо терялись. Возвращает False, если не
+    дождались: по таймауту или потому что одна из abort_tasks (упавший клиент,
+    сигнал остановки) уже завершилась."""
+    async def _ready():
+        await admin_ready.wait()
+        while state.tenants_resuming:
+            await asyncio.sleep(0.2)
+
+    ready_task = asyncio.create_task(_ready())
+    try:
+        await asyncio.wait({ready_task, *abort_tasks}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        return ready_task.done() and not any(t.done() for t in abort_tasks)
+    finally:
+        ready_task.cancel()
 
 
 async def main():
@@ -34,6 +65,7 @@ async def main():
     await init_db()
     await init_access_table(state.DB_PATH)
     await tenants.init_tenants_table()
+    await sender_policy.init_sender_policy_table()
     os.makedirs(state.TENANTS_ROOT, exist_ok=True)
     state.allowed_groups_runtime = await load_allowed_groups()
     log.info(f"Разрешённые группы: {state.allowed_groups_runtime}")
@@ -95,6 +127,24 @@ async def main():
         except NotImplementedError:
             signal.signal(sig, lambda s, f: _request_stop())
 
+    # Сначала подключаемся к MAX, и только потом начинаем читать Telegram.
+    admin_ready = asyncio.Event()
+
+    @state.max_client.on_start()
+    async def _mark_admin_ready(c):
+        admin_ready.set()
+
+    max_task = asyncio.create_task(state.max_client.start())
+    stopper = asyncio.create_task(stop_event.wait())
+
+    if await wait_until_max_ready(admin_ready, {max_task, stopper}):
+        log.info("MAX подключён, начинаю принимать сообщения из Telegram")
+    else:
+        log.warning(
+            f"MAX не подключился за {STARTUP_READY_TIMEOUT} с (или бот останавливается): "
+            "начинаю принимать сообщения из Telegram без ожидания"
+        )
+
     polling_task = asyncio.create_task(
         state.dp.start_polling(
             state.tg_bot,
@@ -110,12 +160,8 @@ async def main():
             handle_signals=False,
         )
     )
-    await asyncio.sleep(2)
-
-    max_task = asyncio.create_task(state.max_client.start())
 
     # ждём либо сигнал, либо падение одной из задач
-    stopper = asyncio.create_task(stop_event.wait())
     done, pending = await asyncio.wait(
         {polling_task, max_task, stopper},
         return_when=asyncio.FIRST_COMPLETED,

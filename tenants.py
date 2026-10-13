@@ -38,6 +38,7 @@ from config import ADMIN_ID
 from formatters import safe_html
 import auth_flow
 import db_meta
+import sender_policy
 import state
 
 # owner_id -> asyncio.Task, который держит client.start() (долгоживущий).
@@ -98,16 +99,27 @@ async def resume_all_tenants():
     async with aiosqlite.connect(state.DB_PATH) as db:
         async with db.execute(
             """
-            SELECT owner_id, max_phone FROM tenant_accounts
+            SELECT owner_id, max_phone, status FROM tenant_accounts
             WHERE status IN ('awaiting_login', 'awaiting_group', 'active')
               AND max_phone IS NOT NULL
             """
         ) as cur:
             rows = await cur.fetchall()
 
-    for owner_id, phone in rows:
+    for owner_id, phone, status in rows:
         state.log.info(f"Переподключаю tenant'а {owner_id} после рестарта бота")
-        asyncio.create_task(_run_login(owner_id, phone))
+        if status == "active":
+            # Группу этого владельца бот начнёт обслуживать, только когда вход
+            # в MAX завершится (см. state.tenants_resuming и bridge.main).
+            state.tenants_resuming.add(owner_id)
+        asyncio.create_task(_resume_one(owner_id, phone))
+
+
+async def _resume_one(owner_id: int, phone: str):
+    try:
+        await _run_login(owner_id, phone)
+    finally:
+        state.tenants_resuming.discard(owner_id)  # и при неудачном входе: ждать больше нечего
 
 
 async def init_tenants_table():
@@ -182,6 +194,8 @@ async def send_group_instructions(tg_group_id: int):
             "<code>/ping слово</code> — задать слово, которое при появлении в MAX-сообщении "
             "будет превращаться в настоящее синее упоминание тебя здесь.\n\n"
             "<code>/retry</code> — переподключиться к MAX, если связь оборвалась.\n\n"
+            "<code>/senders</code> — пиши боту в личку: кто из группы может писать в MAX от твоего имени "
+            "(по умолчанию только ты).\n\n"
             "<code>/support текст</code> — написать мне, если что-то не так.\n\n"
             "<code>/info</code> — показать эту инструкцию ещё раз.",
             parse_mode="HTML",
@@ -384,6 +398,7 @@ async def _run_login(owner_id: int, phone: str):
                 client, tg_group_id=prior_tg_group_id, db_path=state.tenant_db_path(owner_id)
             )
             state.tenant_group_map[prior_tg_group_id] = owner_id
+            state.tenants_resuming.discard(owner_id)
             await _set_status(owner_id, "active")
             # Добор пропущенного — теперь с границей по времени (last_seen_at,
             # см. relay_max_to_tg._backfill_missed_messages): без неё
@@ -550,6 +565,8 @@ async def perform_logout(owner_id: int) -> dict:
             (owner_id,),
         )
         await db.commit()
+
+    await sender_policy.reset(owner_id)
 
     return {"server_logout": server_logout, "tg_group_id": prior_group_id, "was_logged_in": was_logged_in}
 

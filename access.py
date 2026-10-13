@@ -203,7 +203,7 @@ def setup_access(dp: Dispatcher, bot: Bot, db_path: str, admin_id: int):
 
         if uid == _admin_id:
             await message.reply(
-                "Привет, админ.\nКоманды моста: /ping /alias /chats /groups /bind …"
+                "Привет, админ.\nКоманды моста: /ping /alias /chats /groups /bind /senders …"
             )
             return
 

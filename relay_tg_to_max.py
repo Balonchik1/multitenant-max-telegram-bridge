@@ -27,6 +27,7 @@ from db_messages import (
 from db_meta import get_alias
 from media import download_tg_file, safe_remove, process_media_group
 import state
+import sender_policy
 import pymax_patches  # noqa: F401  (подменяет UploadService.upload_photo при импорте)
 
 import aiosqlite
@@ -77,7 +78,113 @@ def _is_size_related_error(e: Exception) -> bool:
     return "file is too big" in str(e).lower()
 
 
+def _is_url_fetch_error(e: Exception) -> bool:
+    """Telegram не смог сам скачать файл по ссылке. По ссылке он берёт только
+    видео до 20 МБ (а общий лимит бота 50 МБ действует при загрузке файлом),
+    а на большее или на недоступную ссылку отвечает именно так. «file is too
+    big» сюда не входит: это уже окончательный отказ по размеру."""
+    text = str(e).lower()
+    return any(s in text for s in (
+        "failed to get http url content",
+        "wrong type of the web page content",
+    ))
+
+
+class _VideoTooBig(Exception):
+    pass
+
+
+async def _download_video_for_upload(url: str, max_bytes: int) -> str | None:
+    """Скачивает видео по ссылке MAX во временный файл (потоком, без загрузки в
+    память). Возвращает путь или None, если не вышло или файл больше лимита."""
+    import aiohttp
+    import tempfile
+    from urllib.parse import urlparse
+
+    ext = os.path.splitext(urlparse(url).path)[1] or ".mp4"
+    tmp_path = None
+    try:
+        timeout = aiohttp.ClientTimeout(total=300, sock_read=60)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    state.log.warning(f"Скачивание видео: HTTP {resp.status}")
+                    return None
+                if resp.content_length and resp.content_length > max_bytes:
+                    state.log.info(f"Видео больше лимита: {resp.content_length} байт")
+                    return None
+                with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                    tmp_path = tmp.name
+                    total = 0
+                    async for chunk in resp.content.iter_chunked(1024 * 1024):
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise _VideoTooBig()
+                        tmp.write(chunk)
+        return tmp_path
+    except _VideoTooBig:
+        state.log.info("Видео больше лимита (размер выяснился при скачивании)")
+    except Exception as e:
+        state.log.warning(f"Не удалось скачать видео для загрузки: {e}")
+    if tmp_path:
+        await safe_remove(tmp_path)
+    return None
+
+
+async def _retry_video_by_upload(kwargs: dict):
+    """Telegram не смог скачать видео по ссылке — скачиваем сами (до лимита
+    бота) и загружаем файлом. Возвращает отправленное сообщение или None."""
+    from aiogram.types import FSInputFile
+
+    path = await _download_video_for_upload(kwargs["video"], state.MAX_FILE_SIZE)
+    if not path:
+        return None
+    try:
+        new_kwargs = dict(kwargs)
+        new_kwargs["video"] = FSInputFile(path)
+        sent = await _send_tg_method("send_video", new_kwargs)
+        state.log.info("Видео отправлено загрузкой файла: по ссылке Telegram его не скачал")
+        return sent
+    except Exception as e:
+        state.log.warning(f"Загрузка видео файлом тоже не удалась: {e}")
+        return None
+    finally:
+        await safe_remove(path)
+
+
+_recreate_locks: dict[tuple[int, int], asyncio.Lock] = {}
+
+
 async def _recreate_topic(
+    tg_group_id: int,
+    max_chat_id: int,
+    db_path: str,
+    max_sender_id: int | None = None,
+    failed_thread_id: int | None = None,
+) -> int | None:
+    """Пересоздаёт тему удалённого диалога, но не больше одной новой темы на
+    всех, кто разом упёрся в одну и ту же мёртвую тему (например добор
+    пропущенных после реконнекта кладёт в очередь несколько сообщений с
+    одним и тем же старым thread_id, и каждое раньше заводило СВОЮ новую
+    тему, пока Telegram не останавливал это flood control'ом). Если пока мы
+    ждали очереди тема уже пересоздана — возвращаем её."""
+    lock = _recreate_locks.setdefault((tg_group_id, max_chat_id), asyncio.Lock())
+    async with lock:
+        if failed_thread_id is not None:
+            try:
+                async with aiosqlite.connect(db_path) as db:
+                    async with db.execute(
+                        "SELECT telegram_thread_id FROM dialogs WHERE max_chat_id = ?", (max_chat_id,)
+                    ) as cur:
+                        row = await cur.fetchone()
+                if row and row[0] and row[0] != failed_thread_id:
+                    return row[0]
+            except Exception as e:
+                state.log.warning(f"Проверка уже пересозданной темы для max_chat_id={max_chat_id}: {e}")
+        return await _do_recreate_topic(tg_group_id, max_chat_id, db_path, max_sender_id)
+
+
+async def _do_recreate_topic(
     tg_group_id: int, max_chat_id: int, db_path: str, max_sender_id: int | None = None
 ) -> int | None:
     """Старая тема для этого MAX-диалога удалена — стираем протухшую
@@ -312,7 +419,9 @@ async def tg_worker():
                 ):
                     recreated_topic = True
                     stray_message = sent_message
-                    new_thread_id = await _recreate_topic(kwargs["chat_id"], max_chat_id, db_path, max_sender_id)
+                    new_thread_id = await _recreate_topic(
+                        kwargs["chat_id"], max_chat_id, db_path, max_sender_id, failed_thread_id=intended_thread
+                    )
                     if new_thread_id is not None:
                         kwargs["message_thread_id"] = new_thread_id
                         sent_message = None
@@ -335,14 +444,31 @@ async def tg_worker():
                     and _is_missing_thread_error(e)
                 ):
                     recreated_topic = True
-                    new_thread_id = await _recreate_topic(kwargs["chat_id"], max_chat_id, db_path, max_sender_id)
+                    new_thread_id = await _recreate_topic(
+                        kwargs["chat_id"], max_chat_id, db_path, max_sender_id,
+                        failed_thread_id=kwargs.get("message_thread_id"),
+                    )
                     if new_thread_id is not None:
                         kwargs["message_thread_id"] = new_thread_id
                         continue
 
-                if attempt == retries:
-                    state.log.error(f"Ошибка отправки из очереди после {retries + 1} попыток: {e}")
+                url_video_failed = (
+                    method == "send_video"
+                    and isinstance(kwargs.get("video"), str)
+                    and _is_url_fetch_error(e)
+                )
+                # Ошибка скачивания по ссылке не лечится повтором — сразу к
+                # загрузке файлом ниже, без пауз между одинаковыми попытками.
+                if attempt == retries or url_video_failed:
+                    state.log.error(f"Ошибка отправки из очереди (попытка {attempt + 1}): {e}")
                     chat_id = kwargs.get("chat_id")
+
+                    # Telegram по ссылке берёт видео только до 20 МБ, а
+                    # лимит бота — 50 МБ: на такой ошибке сначала скачиваем
+                    # видео сами и загружаем файлом, а превью — только если и
+                    # это не вышло.
+                    if url_video_failed:
+                        sent_message = await _retry_video_by_upload(kwargs)
 
                     # Видео без подтверждённого размера, которое всё же не
                     # получилось отправить целиком (например реально
@@ -350,7 +476,7 @@ async def tg_worker():
                     # того чтобы просто показать ошибку (см. relay_max_to_tg
                     # .py, media_items[...]["fallback_thumbnail"]).
                     fallback = task.get("fallback")
-                    if fallback and _is_content_send_error(e):
+                    if not sent_message and fallback and _is_content_send_error(e):
                         # Причину дописываем именно тут, а не заранее в
                         # relay_max_to_tg.py — там ещё нет настоящей ошибки
                         # отправки, только предположение "размер не
@@ -371,7 +497,16 @@ async def tg_worker():
                             state.log.warning(f"Fallback на превью тоже не удался: {fe}")
 
                     if not sent_message:
-                        if _is_content_send_error(e):
+                        if _is_missing_thread_error(e):
+                            # Тема удалена, а новую завести не вышло (например,
+                            # Telegram ограничил создание тем). Это не поломка
+                            # моста и не про права бота — не пугаем чек-листом
+                            # про администратора, при следующем сообщении
+                            # диалога тема создастся заново.
+                            state.log.warning(
+                                f"Сообщение не доставлено: тема удалена и не пересоздалась (max_chat_id={max_chat_id})"
+                            )
+                        elif _is_content_send_error(e):
                             # Проблема в конкретном файле/ссылке, не в группе —
                             # без общей тревоги с чек-листом про админку, только
                             # тихая заметка в саму тему, если она известна.
@@ -390,6 +525,7 @@ async def tg_worker():
                             if owner_id is not None:
                                 import tenants  # отложенный импорт, см. докстринг модуля
                                 await tenants.notify_group_broken(owner_id, chat_id, f"не смог отправить сообщение ({e})")
+                    break
                 else:
                     await asyncio.sleep(1.5 * (attempt + 1))
 
@@ -623,7 +759,7 @@ async def _send_voice_with_fallback(max_client, *, chat_id, text, reply_to, path
         )
 
 
-_PRIVATE_ONLY_COMMANDS = ("/logout", "/cancel")
+_PRIVATE_ONLY_COMMANDS = ("/logout", "/cancel", "/senders")
 
 
 def _is_private_only_command(text: str) -> bool:
@@ -655,6 +791,12 @@ async def telegram_to_max(message: TgMessage):
         # решил бы, что команда выполнилась, а текст ушёл бы в MAX как обычное
         # сообщение.
         await message.reply("Эту команду нужно писать боту в личные сообщения, а не в группе.")
+        return
+
+    # В MAX уходит от лица владельца, поэтому чужие сообщения по умолчанию не
+    # пересылаем (см. sender_policy.py и команду /senders).
+    if not sender_policy.message_allowed(message):
+        await sender_policy.notify_rejected(message)
         return
 
     # === Обработка альбомов ===
@@ -704,6 +846,11 @@ async def telegram_to_max(message: TgMessage):
             # так что это реально станет жирным, как и fwd_line в сторону MAX → TG.
             marker = f"🔁 **Переслано от {forward_name}**"
             text = f"{marker}\n{text}" if text else marker
+
+        # В режиме «всем» к чужим сообщениям добавляем имя автора (см. sender_policy.py).
+        sender_prefix = sender_policy.author_prefix(message)
+        has_own_text = bool(text)
+        text = sender_policy.with_prefix(sender_prefix, text)
 
         # Определяем reply_to
         reply_to_max_id = None
@@ -893,7 +1040,7 @@ async def telegram_to_max(message: TgMessage):
                 tmp_path = await download_tg_file(message.sticker.file_id, suffix=ext)
 
                 emoji = message.sticker.emoji or ""
-                sticker_caption = text or f"Стикер {emoji}".strip()
+                sticker_caption = text if has_own_text else f"{sender_prefix}Стикер {emoji}".strip()
 
                 sent = None
                 if ext == ".webp":
@@ -993,6 +1140,8 @@ async def telegram_edited_to_max(message: TgMessage):
     max_client, db_path = _resolve_route(message.chat.id)
     if max_client is None:
         return
+    if not sender_policy.message_allowed(message):
+        return
     if not message.message_thread_id:
         return
 
@@ -1008,6 +1157,7 @@ async def telegram_edited_to_max(message: TgMessage):
         if not new_text:
             state.log.info("Редактирование без текста — пропускаю")
             return
+        new_text = sender_policy.with_prefix(sender_policy.author_prefix(message), new_text)
 
         await max_client.edit_message(
             chat_id=max_chat_id,
@@ -1029,6 +1179,8 @@ async def telegram_reaction_to_max(reaction: MessageReactionUpdated):
     значит все реакции сняли."""
     max_client, db_path = _resolve_route(reaction.chat.id)
     if max_client is None:
+        return
+    if not sender_policy.reaction_allowed(reaction):
         return
     try:
         mapping = await get_max_message_id(reaction.chat.id, reaction.message_id, db_path=db_path)
