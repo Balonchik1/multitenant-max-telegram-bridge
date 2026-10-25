@@ -30,11 +30,18 @@ from db_messages import (
     get_recent_messages_for_reaction_poll,
     get_known_reaction,
     set_known_reaction,
+    get_group_title,
+    set_group_title,
 )
 from mentions import apply_max_mentions
 from relay_tg_to_max import get_or_create_topic
 from media import safe_remove
 import state
+
+try:
+    import local_ext  # необязательное локальное расширение, в репозиторий не входит
+except ImportError:
+    local_ext = None
 
 # --- Монкипатч pymax: реальный MAX шлёт messageId в reaction_update как
 # число, а pymax 2.4.1 объявляет ReactionUpdateEvent.message_id: str —
@@ -85,16 +92,63 @@ async def _get_file_info_with_fallback(
             raise first_error
 
 
-def _format_title_change(who: str, title: str | None) -> str:
+def _format_title_change(who: str, title: str | None, old_title: str | None = None) -> str:
     """Служебное событие MAX «title» — переименование группы. Новое название
     лежит в поле title вложения; если его по какой-то причине нет, всё равно
-    сообщаем, что название сменили."""
+    сообщаем, что название сменили. Старое название MAX не присылает, оно берётся
+    из того, что бот запомнил раньше (если знает)."""
     if title:
+        if old_title and old_title != str(title):
+            names = f"«{safe_html(str(old_title))}» → «{safe_html(str(title))}»"
+        else:
+            names = f"«{safe_html(str(title))}»"
         return (
             f"<blockquote><i>✏️ <b>{safe_html(who)}</b> изменил(а) название группы: "
-            f"«{safe_html(str(title))}»</i></blockquote>"
+            f"{names}</i></blockquote>"
         )
     return f"<blockquote><i>✏️ <b>{safe_html(who)}</b> изменил(а) название группы</i></blockquote>"
+
+
+async def _describe_title_change(max_chat_id: int, who: str, new_title, *, db_path: str) -> str:
+    """Текст про переименование со старым названием (если оно известно) и запоминание
+    нового. Сбой базы не должен ломать пересылку самого уведомления."""
+    old_title = None
+    try:
+        old_title = await get_group_title(max_chat_id, db_path=db_path)
+    except Exception as e:
+        state.log.warning(f"Не удалось прочитать прежнее название группы {max_chat_id}: {e}")
+    text = _format_title_change(who, new_title, old_title)
+    if new_title:
+        try:
+            await set_group_title(max_chat_id, str(new_title), db_path=db_path)
+        except Exception as e:
+            state.log.warning(f"Не удалось запомнить новое название группы {max_chat_id}: {e}")
+    return text
+
+
+async def _seed_group_titles(client: Client, *, db_path: str):
+    """Запоминает текущие названия групп (только если ещё не знаем), чтобы первое же
+    переименование показало и старое название. Список чатов берём тем же способом,
+    что и /chats: кэш клиента при старте может быть неполным, поэтому ещё и fetch_chats."""
+    try:
+        chats = list(getattr(client, "chats", None) or [])
+        try:
+            fetched = await asyncio.wait_for(client.fetch_chats(), timeout=20)
+            if fetched:
+                chats = list(fetched)
+        except Exception as e:
+            state.log.warning(f"Названия групп: fetch_chats не удался: {e}")
+        saved = 0
+        for chat in chats:
+            chat_id = getattr(chat, "id", None)
+            title = getattr(chat, "title", None)
+            if chat_id is None or chat_id >= 0 or not title:
+                continue
+            await set_group_title(chat_id, str(title), db_path=db_path, only_if_missing=True)
+            saved += 1
+        state.log.info(f"Названия групп: запомнено/обновлено {saved}")
+    except Exception as e:
+        state.log.warning(f"Названия групп: не удалось запомнить: {e}")
 
 
 def _strip_html_tags(text: str) -> str:
@@ -179,6 +233,15 @@ def _render_call_text(attach) -> str:
     return kind
 
 
+def _reply_tg_id_in_chat(mapping, target_chat_id: int) -> int | None:
+    """Ответить в Telegram можно только на сообщение из того же чата. Если MAX-чат
+    перенесли в другую TG-группу, старые сообщения живут в прежней группе, и ссылка
+    на них сломала бы отправку («message to be replied not found»)."""
+    if mapping and mapping[0] == target_chat_id:
+        return mapping[2]
+    return None
+
+
 async def _handle_max_message(message: MaxMessage, client: Client, *, tg_group_id: int, db_path: str):
     # Свои обычные сообщения игнорируем, системные CONTROL — пропускаем
     is_control = False
@@ -248,6 +311,8 @@ async def _handle_max_message(message: MaxMessage, client: Client, *, tg_group_i
         except Exception as e:
             state.log.warning(f"Имя отправителя: {e}")
             prefix = f"<b>{message.sender}</b>\n"
+    if local_ext is not None and target_chat_id == TG_GROUP_FLAT:
+        prefix = local_ext.flat_prefix(message.chat_id, prefix)
 
     data = message.model_dump()
 
@@ -261,8 +326,7 @@ async def _handle_max_message(message: MaxMessage, client: Client, *, tg_group_i
         )
         if replied_max_id:
             mapping = await get_tg_message_id(message.chat_id, replied_max_id, db_path=db_path)
-            if mapping:
-                reply_to_tg_id = mapping[2]  # tg_message_id
+            reply_to_tg_id = _reply_tg_id_in_chat(mapping, target_chat_id)
 
     is_forward, src_msg, src_chat_id, forward_text, attaches, origin_name = unwrap_forward(message)
 
@@ -867,7 +931,9 @@ async def _handle_max_message(message: MaxMessage, client: Client, *, tg_group_i
                         )
                     elif event == "title":
                         who = await get_name(message.sender)
-                        text = _format_title_change(who, get_extra("title"))
+                        text = await _describe_title_change(
+                            message.chat_id, who, get_extra("title"), db_path=db_path
+                        )
                     elif event == "joinbylink":
                         who = await get_name(get_extra("userId") or get_extra("user_id") or message.sender)
                         text = f"<blockquote><i>🔗 <b>{safe_html(who)}</b> присоединился(ась) по ссылке</i></blockquote>"
@@ -889,6 +955,9 @@ async def _handle_max_message(message: MaxMessage, client: Client, *, tg_group_i
                             text = f"<blockquote><i>ℹ️ {safe_html(sys_text)}</i></blockquote>"
                     else:
                         text = f"ℹ️ Системное событие группы: <code>{safe_html(event)}</code>"
+
+                    if local_ext is not None and target_chat_id == TG_GROUP_FLAT:
+                        text = local_ext.flat_prefix(message.chat_id, "") + text
 
                     kwargs = {
                         "chat_id": target_chat_id,
@@ -1234,6 +1303,8 @@ async def _handle_message_edit(message: MaxMessage, client: Client, *, db_path: 
                 prefix = f"<b>{safe_html(name)}</b>\n"
             except Exception:
                 pass
+        if local_ext is not None and tg_chat_id == TG_GROUP_FLAT:
+            prefix = local_ext.flat_prefix(message.chat_id, prefix)
 
         await state.tg_bot.edit_message_text(
             chat_id=tg_chat_id,
@@ -1293,6 +1364,8 @@ async def _handle_message_delete(event, client: Client, *, db_path: str):
                     prefix = f"<b>{safe_html(name)}</b>\n"
                 except Exception:
                     pass
+            if local_ext is not None and tg_chat_id == TG_GROUP_FLAT:
+                prefix = local_ext.flat_prefix(max_chat_id, prefix)
 
             if body:
                 new_text = f"{prefix}{safe_html(body)}\n\n{mark}"
@@ -1474,6 +1547,29 @@ def _msg_time_seconds(msg) -> int:
     return t // 1000 if t > 10**12 else t
 
 
+async def _heartbeat_once(client: Client, *, db_path: str) -> bool:
+    """Отмечает «точно на связи», только если клиент MAX сейчас подключён. Иначе
+    во время обрыва (например, MAX отозвал вход и бот ждёт SMS-код) метка уезжала
+    бы вперёд, и после возвращения связи бот добирал бы пропущенное только за
+    последние минуты, а не за весь простой."""
+    connected = getattr(client, "is_connected", True)
+    if callable(connected):
+        connected = connected()
+    if not connected:
+        return False
+    await set_last_seen_at(int(time.time()), db_path=db_path)
+    return True
+
+
+def _backfill_tg_groups(tg_group_id: int) -> tuple[int, ...]:
+    """Чаты каких Telegram-групп добирать для этого клиента. У основного аккаунта
+    кроме основной группы есть плоская: её чаты тоже нужно добирать, иначе
+    сообщения, пришедшие во время перезапуска или обрыва связи, там пропадают."""
+    if tg_group_id == TG_GROUP_ID and TG_GROUP_FLAT:
+        return (tg_group_id, TG_GROUP_FLAT)
+    return (tg_group_id,)
+
+
 async def _backfill_missed_messages(client: Client, *, tg_group_id: int, db_path: str, backward: int = 30):
     """При каждом логине (включая реконнект по сохранённой сессии) явно
     запрашиваем историю (chat.history()) по каждому уже известному диалогу
@@ -1504,10 +1600,12 @@ async def _backfill_missed_messages(client: Client, *, tg_group_id: int, db_path
         return
 
     try:
+        groups = _backfill_tg_groups(tg_group_id)
+        placeholders = ", ".join("?" for _ in groups)
         async with aiosqlite.connect(db_path) as db:
             async with db.execute(
-                "SELECT max_chat_id FROM dialogs WHERE telegram_chat_id = ?",
-                (tg_group_id,),
+                f"SELECT max_chat_id FROM dialogs WHERE telegram_chat_id IN ({placeholders})",
+                groups,
             ) as cursor:
                 chat_ids = [row[0] for row in await cursor.fetchall()]
     except Exception as e:
@@ -1567,7 +1665,7 @@ def register_tenant_handlers(client: Client, *, tg_group_id: int, db_path: str):
         случайного прошлого момента."""
         while not getattr(client, "_bridge_stopped", False):
             try:
-                await set_last_seen_at(int(time.time()), db_path=db_path)
+                await _heartbeat_once(client, db_path=db_path)
             except Exception as e:
                 state.log.warning(f"heartbeat last_seen_at: {e}")
             await asyncio.sleep(180)
@@ -1576,6 +1674,7 @@ def register_tenant_handlers(client: Client, *, tg_group_id: int, db_path: str):
     async def _on_start(c):
         print("MAX запущен")
         print(c.me)
+        await _seed_group_titles(c, db_path=db_path)
         await asyncio.sleep(5)
         print("Готов принимать сообщения")
         await _backfill_missed_messages(c, tg_group_id=tg_group_id, db_path=db_path)

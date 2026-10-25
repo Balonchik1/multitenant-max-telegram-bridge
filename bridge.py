@@ -14,6 +14,7 @@ import os
 import signal
 
 import state
+import login_guard
 import session_backup
 from access import init_access_table
 from config import SESSION_BACKUP_KEY
@@ -57,6 +58,23 @@ async def wait_until_max_ready(
         return ready_task.done() and not any(t.done() for t in abort_tasks)
     finally:
         ready_task.cancel()
+
+
+async def run_admin_client(admin_ready: asyncio.Event) -> None:
+    """Запускает основной клиент MAX. Если вход слетел и заказ SMS не разрешён
+    (см. login_guard.py), сообщает админу и оставляет аккаунт отключённым, но не
+    завершает задачу: иначе бот ушёл бы в перезапуск и отключил бы заодно мост
+    подключённых пользователей. Дальше всё ждёт команды /relogin."""
+    try:
+        await state.max_client.start()
+    except login_guard.LoginNotAllowed:
+        state.admin_login_blocked = True
+        log.warning(
+            "Основной аккаунт MAX: вход слетел, автоматический заказ SMS-кода отключён; жду команды /relogin"
+        )
+        admin_ready.set()  # ждать подключения нечего
+        await commands.notify_login_needed()
+        await asyncio.Event().wait()
 
 
 async def main():
@@ -132,9 +150,11 @@ async def main():
 
     @state.max_client.on_start()
     async def _mark_admin_ready(c):
+        login_guard.mark_login_ok()
+        state.admin_login_blocked = False
         admin_ready.set()
 
-    max_task = asyncio.create_task(state.max_client.start())
+    max_task = asyncio.create_task(run_admin_client(admin_ready))
     stopper = asyncio.create_task(stop_event.wait())
 
     if await wait_until_max_ready(admin_ready, {max_task, stopper}):

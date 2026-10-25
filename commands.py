@@ -1,5 +1,6 @@
 """Админские слэш-команды бота (/groups, /link, /ping, /alias, /chats, ...)."""
 import html
+import os
 import subprocess
 import sys
 import time
@@ -22,7 +23,62 @@ from db_meta import (
     delete_mention_link,
 )
 from db_messages import save_thread, get_dialog_by_thread
+import login_guard
 import state
+
+
+LOGIN_NEEDED_TEXT = (
+    "⚠️ <b>MAX завершил вход основного аккаунта</b>\n\n"
+    "Скорее всего, сессию закрыл сам MAX (так бывает, например, если давно не заходить в "
+    "приложение). Пока аккаунт не подключён, сообщения из MAX к вам не приходят и ваши "
+    "сообщения туда не уходят. Подключённые пользователи работают как обычно.\n\n"
+    "SMS-коды бот сам больше не заказывает, чтобы не засыпать телефон и не получить "
+    "блокировку входа. Чтобы войти заново, пришлите команду /relogin: бот перезапустится, "
+    "закажет <b>один</b> SMS-код и попросит прислать его сюда. Подключённые пользователи "
+    "при этом отключатся примерно на минуту."
+)
+
+
+async def notify_login_needed():
+    try:
+        await state.tg_bot.send_message(ADMIN_ID, LOGIN_NEEDED_TEXT, parse_mode="HTML")
+    except Exception as e:
+        state.log.warning(f"Не удалось сообщить админу, что вход в MAX слетел: {e}")
+
+
+def _restart_process_soon(delay: float = 2.0) -> None:
+    """Выход с ненулевым кодом: systemd (Restart=on-failure) поднимет бота заново."""
+    state._main_loop.call_later(delay, os._exit, 1)
+
+
+def _main_client_connected() -> bool:
+    connected = getattr(state.max_client, "is_connected", False)
+    return bool(connected() if callable(connected) else connected)
+
+
+def _is_relogin_command(message: TgMessage) -> bool:
+    if message.chat.type != "private" or message.from_user is None or not message.text:
+        return False
+    parts = message.text.strip().split()
+    return bool(parts) and parts[0].split("@")[0] == "/relogin"
+
+
+@state.dp.message(_is_relogin_command)
+async def cmd_relogin(message: TgMessage):
+    if message.from_user.id != ADMIN_ID:
+        return
+    if _main_client_connected() and not state.admin_login_blocked:
+        await message.reply("Основной аккаунт MAX уже подключён, входить заново не нужно.")
+        return
+    login_guard.grant_permission()
+    await message.reply(
+        "Хорошо. Перезапускаю бота и заказываю один SMS-код для основного аккаунта: он придёт "
+        "на телефон, пришлите его мне обычным сообщением. Подключённые пользователи отключатся "
+        "примерно на минуту.\n\n"
+        "Если код не приходил или не подошёл, SMS автоматически больше заказываться не будет: "
+        "просто снова пришлите /relogin."
+    )
+    _restart_process_soon()
 
 
 @state.dp.message(lambda m: m.text and m.text.startswith("/info"))

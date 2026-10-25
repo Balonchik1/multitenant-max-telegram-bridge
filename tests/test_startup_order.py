@@ -88,7 +88,7 @@ async def test_only_active_tenants_are_waited_for(tmp_path, monkeypatch):
     release = asyncio.Event()
     resumed = []
 
-    async def fake_run_login(owner_id, phone):
+    async def fake_run_login(owner_id, phone, **kwargs):
         resumed.append(owner_id)
         await release.wait()
 
@@ -107,7 +107,7 @@ async def test_only_active_tenants_are_waited_for(tmp_path, monkeypatch):
 
 
 async def test_failed_login_still_stops_the_waiting(monkeypatch):
-    async def failing_login(owner_id, phone):
+    async def failing_login(owner_id, phone, **kwargs):
         raise RuntimeError("MAX недоступен")
 
     monkeypatch.setattr(tenants, "_run_login", failing_login)

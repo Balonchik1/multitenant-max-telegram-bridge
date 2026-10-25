@@ -19,6 +19,7 @@ from pymax import Client
 from config import TG_TOKEN, MAX_PHONE, ADMIN_ID
 from access import setup_access
 from db_meta import set_db_path
+import login_guard
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,7 +34,12 @@ max_client = Client(
     phone=MAX_PHONE,
     work_dir="cache",
     session_name="main.db",
+    # Вход по SMS без самовольного повтора: см. login_guard.py
+    auth_flow=login_guard.build_auth_flow(),
 )
+
+# True, пока основной аккаунт отключён и ждёт команды /relogin (см. bridge.run_admin_client)
+admin_login_blocked = False
 
 # Telegram бот
 tg_bot = Bot(token=TG_TOKEN)

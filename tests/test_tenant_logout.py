@@ -190,7 +190,7 @@ class LoginInProgressClient(FakeClient):
 
     instances = []
 
-    def __init__(self, phone=None, work_dir=None, session_name=None):
+    def __init__(self, phone=None, work_dir=None, session_name=None, auth_flow=None):
         super().__init__()
         self._stop = asyncio.Event()
         LoginInProgressClient.instances.append(self)

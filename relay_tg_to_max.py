@@ -22,13 +22,18 @@ from aiogram.exceptions import TelegramRetryAfter
 from config import TG_GROUP_FLAT, FLAT_MAX_CHAT_ID
 from db_messages import (
     get_max_message_id, save_message_mapping, get_thread, save_thread,
-    find_topic_name_collision, get_thread_by_sender_id,
+    find_topic_name_collision, get_thread_by_sender_id, set_known_reaction,
 )
 from db_meta import get_alias
 from media import download_tg_file, safe_remove, process_media_group
 import state
 import sender_policy
 import pymax_patches  # noqa: F401  (подменяет UploadService.upload_photo при импорте)
+
+try:
+    import local_ext  # необязательное локальное расширение, в репозиторий не входит
+except ImportError:
+    local_ext = None
 
 import aiosqlite
 import asyncio
@@ -66,6 +71,10 @@ def _is_content_send_error(e: Exception) -> bool:
         "wrong file identifier",
         "wrong type of the web page content",
         "file is too big",
+        # Альбомы и группы медиа Telegram отвечает так, когда не смог забрать файл по ссылке
+        # («failed to send message #1 with the error message "WEBPAGE_CURL_FAILED"»).
+        "webpage_curl_failed",
+        "webpage_media_empty",
     ))
 
 
@@ -823,6 +832,8 @@ async def telegram_to_max(message: TgMessage):
     try:
         if message.chat.id == TG_GROUP_FLAT:
             max_chat_id = FLAT_MAX_CHAT_ID
+            if local_ext is not None:
+                max_chat_id = await local_ext.flat_target(message, max_chat_id, db_path)
         else:
             async with aiosqlite.connect(db_path) as db:
                 async with db.execute(
@@ -1203,9 +1214,11 @@ async def telegram_reaction_to_max(reaction: MessageReactionUpdated):
             # ошибочно трактовалась как "реакцию сняли".
             is_non_emoji_reaction = bool(reaction.new_reaction)
 
+        applied = None  # что в итоге стоит в MAX от нашего аккаунта (None — реакцию сняли)
         try:
             if is_non_emoji_reaction:
                 await max_client.add_reaction(chat_id=max_chat_id, message_id=max_message_id, reaction="❤️")
+                applied = "❤️"
             elif emoji:
                 # Telegram отдаёт "❤" без variation selector (U+FE0F), а MAX
                 # хранит реакции только в полной форме "❤️" (с ним) — без
@@ -1217,12 +1230,14 @@ async def telegram_reaction_to_max(reaction: MessageReactionUpdated):
                 # раз затронут явно не только heart.
                 try:
                     await max_client.add_reaction(chat_id=max_chat_id, message_id=max_message_id, reaction=emoji)
+                    applied = emoji
                 except Exception as e:
                     if "unknown.like" in str(e).lower() and not emoji.endswith("️"):
                         try:
                             await max_client.add_reaction(
                                 chat_id=max_chat_id, message_id=max_message_id, reaction=emoji + "️"
                             )
+                            applied = emoji + "️"
                         except Exception:
                             # У Telegram реакций заметно больше, чем в наборе,
                             # который принимает MAX (например "🐳") — вместо
@@ -1233,6 +1248,7 @@ async def telegram_reaction_to_max(reaction: MessageReactionUpdated):
                             await max_client.add_reaction(
                                 chat_id=max_chat_id, message_id=max_message_id, reaction="❤️"
                             )
+                            applied = "❤️"
                     else:
                         raise
             else:
@@ -1242,5 +1258,14 @@ async def telegram_reaction_to_max(reaction: MessageReactionUpdated):
             # тихо логируем, без сообщения в топик (та же логика, что и у
             # _handle_reaction_update).
             state.log.warning(f"Не удалось передать реакцию TG → MAX (max_id={max_message_id}): {e}")
+        else:
+            # Опрос реакций MAX (relay_max_to_tg._poll_reactions_once) отражает в
+            # Telegram всё, что отличается от «известной» реакции. Реакция, которую
+            # владелец сам поставил в Telegram и мы только что передали в MAX,
+            # иначе вернулась бы в Telegram эхом от имени бота.
+            try:
+                await set_known_reaction(max_chat_id, max_message_id, applied, db_path=db_path)
+            except Exception as e:
+                state.log.warning(f"Не удалось запомнить переданную реакцию (max_id={max_message_id}): {e}")
     except Exception as e:
         state.log.exception(f"Ошибка обработки реакции TG → MAX: {e}")

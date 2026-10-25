@@ -38,6 +38,7 @@ from config import ADMIN_ID
 from formatters import safe_html
 import auth_flow
 import db_meta
+import login_guard
 import sender_policy
 import state
 
@@ -117,7 +118,9 @@ async def resume_all_tenants():
 
 async def _resume_one(owner_id: int, phone: str):
     try:
-        await _run_login(owner_id, phone)
+        # Тихое переподключение после рестарта: по сохранённой сессии SMS не нужен, а если
+        # MAX отозвал вход, SMS без просьбы человека не заказываем (см. login_guard.py).
+        await _run_login(owner_id, phone, allow_sms=False)
     finally:
         state.tenants_resuming.discard(owner_id)  # и при неудачном входе: ждать больше нечего
 
@@ -231,7 +234,40 @@ async def start_onboarding(owner_id: int):
         state.log.warning(f"start_onboarding: не удалось написать {owner_id}: {e}")
 
 
+_LOGIN_LOST_TEXT = (
+    "⚠️ MAX завершил вход твоего аккаунта в боте. Так бывает, например, если давно не "
+    "заходить в приложение MAX. Пока ты не войдёшь заново, сообщения не пересылаются.\n\n"
+    "Чтобы войти, напиши /retry: MAX пришлёт один SMS-код на твой номер, отправь его мне "
+    "сюда. Бот сам SMS-коды больше не заказывает."
+)
+
+
+async def _report_login_lost(owner_id: int):
+    """MAX отозвал вход подключённого пользователя, а SMS без его просьбы заказывать
+    нельзя (login_guard.py): записываем статус, один раз пишем ему и сообщаем админу.
+    Раньше pymax сам заказывал SMS каждые 10 минут, а запрос кода уходил админу."""
+    await _set_status(owner_id, "failed")
+    state.tenant_clients.pop(owner_id, None)
+    _run_tasks.pop(owner_id, None)
+    try:
+        await state.tg_bot.send_message(owner_id, _LOGIN_LOST_TEXT)
+    except Exception as e:
+        state.log.warning(f"Не удалось написать {owner_id} про слетевший вход в MAX: {e}")
+    try:
+        await state.tg_bot.send_message(
+            ADMIN_ID,
+            f"ℹ️ У пользователя <code>{owner_id}</code> MAX завершил вход аккаунта. SMS бот не заказывал, "
+            "пользователю отправлено «напиши /retry».",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
 async def _handle_login_outcome_failure(owner_id: int, exc: Exception | None):
+    if isinstance(exc, login_guard.LoginNotAllowed):
+        await _report_login_lost(owner_id)
+        return
     if auth_flow.stored_password_rejected:
         await _forget_stored_password(owner_id)
     msg = str(exc) if exc else "неизвестная ошибка"
@@ -302,11 +338,18 @@ def _remember_password_keyboard(owner_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
-async def _run_login(owner_id: int, phone: str):
+async def _run_login(owner_id: int, phone: str, allow_sms: bool = True):
     """Оркестрация входа: держит login_lock только пока идёт сам обмен
     кодом/паролем (до срабатывания on_start либо до ошибки), дальше
-    отпускает лок и оставляет client.start() жить своей жизнью в фоне."""
-    os.makedirs(state.tenant_cache_dir(owner_id), exist_ok=True)
+    отпускает лок и оставляет client.start() жить своей жизнью в фоне.
+
+    allow_sms=True: вход начал сам человек (номер телефона, /retry), и один заказ
+    SMS разрешён. False: тихое переподключение после рестарта, SMS без его просьбы
+    не заказывается."""
+    cache_dir = state.tenant_cache_dir(owner_id)
+    os.makedirs(cache_dir, exist_ok=True)
+    if allow_sms:
+        login_guard.grant_permission(cache_dir)
     # Схема (dialogs/messages/...) в собственной БД tenant'а — без этого
     # первое же входящее сообщение из MAX падает с "no such table: dialogs"
     # (db_path параметризован по каждому tenant'у, но схему в его файле
@@ -315,13 +358,19 @@ async def _run_login(owner_id: int, phone: str):
     import db_messages
     await db_messages.init_db(db_path=state.tenant_db_path(owner_id))
 
-    client = Client(phone=phone, work_dir=state.tenant_cache_dir(owner_id), session_name="main.db")
+    client = Client(
+        phone=phone,
+        work_dir=cache_dir,
+        session_name="main.db",
+        auth_flow=login_guard.build_auth_flow(cache_dir),
+    )
     state.tenant_clients[owner_id] = client
 
     login_done = asyncio.Event()
 
     @client.on_start()
     async def _on_tenant_start(c):
+        login_guard.mark_login_ok(cache_dir)
         login_done.set()
 
     # Сброс состояния предыдущей попытки + подгрузка сохранённого пароля
@@ -392,7 +441,11 @@ async def _run_login(owner_id: int, phone: str):
         # навешиваем обработчики на новый Client и восстанавливаем маппинг
         # группы, без повторной инструкции "создай группу".
         prior_tg_group_id = tenant.get("tg_group_id") if tenant else None
-        if tenant and tenant.get("status") == "active" and prior_tg_group_id:
+        was_active = bool(tenant) and tenant.get("status") == "active"
+        # Группа уже привязана, а статус не «active»: человек сам заново вошёл после того, как
+        # MAX завершил его сессию (/retry). Тоже восстанавливаем мост сразу, без повторной
+        # настройки группы (после /logout и /deny группа сбрасывается, там всё как раньше).
+        if tenant and prior_tg_group_id and tenant.get("status") in ("active", "awaiting_login", "failed", "needs_2fa"):
             import relay_max_to_tg  # отложенный импорт, см. докстринг модуля
             relay_max_to_tg.register_tenant_handlers(
                 client, tg_group_id=prior_tg_group_id, db_path=state.tenant_db_path(owner_id)
@@ -410,6 +463,24 @@ async def _run_login(owner_id: int, phone: str):
             # Тихо — если реконнект прошёл успешно, тенанту не нужно об этом
             # знать, он ничего не заметил. Уведомляем только когда что-то
             # реально требует его действия (2FA, обрыв связи, сломанная группа).
+            if not was_active:
+                # Но если он сам заново входил, подтверждаем, что всё снова работает.
+                if auth_flow.stored_password_rejected:
+                    await _forget_stored_password(owner_id)
+                if auth_flow.last_entered_password:
+                    _pending_remember_password[owner_id] = auth_flow.last_entered_password
+                    await state.tg_bot.send_message(
+                        owner_id,
+                        "✅ Вход в MAX выполнен, мост снова работает!\n\n"
+                        "Запомнить облачный пароль, чтобы не спрашивать его при следующих входах?",
+                        reply_markup=_remember_password_keyboard(owner_id),
+                    )
+                else:
+                    await state.tg_bot.send_message(
+                        owner_id,
+                        "✅ Вход в MAX выполнен, мост снова работает. Пропущенное за время простоя "
+                        "сейчас добавится в твою группу.",
+                    )
             return
 
         await _set_status(owner_id, "awaiting_group")
@@ -451,6 +522,10 @@ async def _watch_tenant_task(owner_id: int, task: asyncio.Task):
         # Задачу уже убрали из _run_tasks (/logout или переподключение новым
         # клиентом) — это не обрыв связи, тенанту сообщать нечего.
         if _run_tasks.get(owner_id) is not task:
+            return
+        if isinstance(e, login_guard.LoginNotAllowed):
+            state.log.warning(f"MAX завершил вход tenant'а {owner_id}; SMS не заказываем, ждём /retry")
+            await _report_login_lost(owner_id)
             return
         state.log.warning(f"MAX-клиент tenant'а {owner_id} завершился с ошибкой: {e}")
         state.tenant_clients.pop(owner_id, None)

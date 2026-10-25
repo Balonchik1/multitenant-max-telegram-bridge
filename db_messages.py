@@ -76,6 +76,12 @@ async def init_db(db_path: str | None = None):
             )
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS group_titles (
+                max_chat_id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS message_reactions (
                 max_chat_id INTEGER NOT NULL,
                 max_message_id INTEGER NOT NULL,
@@ -442,6 +448,30 @@ async def get_recent_messages_for_reaction_poll(hours: int = 2, db_path: str | N
             (f'-{hours} hours',),
         ) as cursor:
             return await cursor.fetchall()
+
+
+async def get_group_title(max_chat_id: int, db_path: str | None = None) -> str | None:
+    """Последнее известное боту название MAX-группы (нужно, чтобы при
+    переименовании показать и старое название: MAX присылает только новое)."""
+    async with aiosqlite.connect(db_path or state.DB_PATH) as db:
+        async with db.execute(
+            "SELECT title FROM group_titles WHERE max_chat_id = ?", (max_chat_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+
+async def set_group_title(max_chat_id: int, title: str, db_path: str | None = None, only_if_missing: bool = False):
+    async with aiosqlite.connect(db_path or state.DB_PATH) as db:
+        action = "DO NOTHING" if only_if_missing else "DO UPDATE SET title = excluded.title"
+        await db.execute(
+            f"""
+            INSERT INTO group_titles (max_chat_id, title) VALUES (?, ?)
+            ON CONFLICT(max_chat_id) {action}
+            """,
+            (max_chat_id, title),
+        )
+        await db.commit()
 
 
 async def get_known_reaction(max_chat_id: int, max_message_id: int, db_path: str | None = None) -> str | None:
